@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeagent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.30.0",
+    "mcp>=1.0.0",
+    "tree-sitter>=0.22.0",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "aiosqlite>=0.20.0",
+    "watchdog>=4.0.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+codeagent = "cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["code_server*", "agent_server*", "cli*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
