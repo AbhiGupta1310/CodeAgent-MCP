@@ -45,6 +45,8 @@ from code_server.tools import (
     list_imports,
     list_symbols,
     read_file_slice,
+    generate_architecture,
+    semantic_search,
 )
 
 load_dotenv()
@@ -158,7 +160,9 @@ async def index_github_repo(github_url: str) -> str:
             f"* list_all_symbols(kind, session_id)\n"
             f"* find_callers(function_name, session_id)\n"
             f"* read_code(file_path, start_line, end_line, session_id)\n"
-            f"* get_imports(file_path, session_id)"
+            f"* get_imports(file_path, session_id)\n"
+            f"* generate_architecture(session_id)\n"
+            f"* semantic_search(query, session_id)"
         )
 
     except Exception as exc:
@@ -334,6 +338,59 @@ async def get_session_status(session_id: str) -> str:
     if not exists:
         return "Session not found. Please run index_github_repo first."
     return "Session is ready. You can ask questions about this codebase."
+
+
+# ---------------------------------------------------------------------------
+# Tool: generate_architecture
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def generate_architecture_diagram(session_id: str) -> str:
+    """Generate a Mermaid.js class diagram of the repository architecture.
+
+    Returns the raw Mermaid string. Use this to draw the architecture of the
+    project and understand its object-oriented structure.
+
+    Parameters
+    ----------
+    session_id:
+        Session ID returned by index_github_repo.
+    """
+    error = await _validate_session(session_id)
+    if error:
+        return error
+
+    await update_last_active(session_id)
+    return await generate_architecture(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Tool: semantic_search
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def semantic_search_tool(query: str, session_id: str) -> str:
+    """Search for concepts using pgvector cosine similarity.
+
+    Use this when you are looking for an idea (e.g. 'where is the user login logic?',
+    'how is database connection handled?') rather than a specific function name.
+
+    Parameters
+    ----------
+    query:
+        The natural language concept to search for.
+    session_id:
+        Session ID returned by index_github_repo.
+    """
+    error = await _validate_session(session_id)
+    if error:
+        return error
+
+    await update_last_active(session_id)
+    results = await semantic_search(query, session_id)
+    return json.dumps(results, indent=2)
 
 
 # ---------------------------------------------------------------------------

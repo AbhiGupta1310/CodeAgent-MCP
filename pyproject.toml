@@ -21,6 +21,7 @@ dependencies = [
     "pytest-asyncio>=0.23.0",
     "python-dotenv>=1.0.0",
     "uvicorn>=0.30.0",
+    "fastembed>=0.2.7",
 ]
 
 [project.scripts]

@@ -66,6 +66,9 @@ async def close_pool() -> None:
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """
+-- Create pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Sessions table: one row per GitHub repo clone
 CREATE TABLE IF NOT EXISTS sessions (
     id           TEXT PRIMARY KEY,
@@ -86,12 +89,15 @@ CREATE TABLE IF NOT EXISTS symbols (
     start_line  INTEGER NOT NULL,
     end_line    INTEGER NOT NULL,
     parent      TEXT,
-    docstring   TEXT
+    docstring   TEXT,
+    embedding   vector(384)
 );
 CREATE INDEX IF NOT EXISTS idx_session_name
     ON symbols(session_id, name);
 CREATE INDEX IF NOT EXISTS idx_session_file
     ON symbols(session_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_symbol_embedding
+    ON symbols USING hnsw (embedding vector_cosine_ops);
 
 -- Imports table: extracted import statements
 CREATE TABLE IF NOT EXISTS imports (

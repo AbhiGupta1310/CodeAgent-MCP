@@ -84,8 +84,8 @@ Want to try it immediately? Add our public hosted endpoint to your MCP client!
 
 ### Using Claude Desktop
 1. Open Claude Desktop.
-2. Go to **Settings (Gear Icon) → Integrations** (or **Connectors**).
-3. Click **Add Integration**.
+2. Go to **Settings (Gear Icon) → Connectors**.
+3. Click **Add Connector** → **Add Custom Connector**.
 4. Enter the Server URL: `https://codeagent-mcp.onrender.com/sse`
 5. Click **Connect**.
 

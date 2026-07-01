@@ -22,6 +22,7 @@ import tree_sitter_python as tspython
 import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Node, Parser
+from fastembed import TextEmbedding
 
 from code_server.db import get_pool
 
@@ -56,6 +57,16 @@ PY_LANGUAGE = Language(tspython.language())
 JS_LANGUAGE = Language(tsjavascript.language())
 TS_LANGUAGE = Language(tstypescript.language_typescript())
 TSX_LANGUAGE = Language(tstypescript.language_tsx())
+
+_embedding_model: Optional[TextEmbedding] = None
+
+def get_embedding_model() -> TextEmbedding:
+    global _embedding_model
+    if _embedding_model is None:
+        logger.info("Loading FastEmbed model (BAAI/bge-small-en-v1.5) ...")
+        _embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    return _embedding_model
+
 
 
 def _get_language_for_extension(file_path: str) -> Optional[Language]:
@@ -121,12 +132,26 @@ async def index_file(file_path: str, session_id: str) -> None:
             str(path),
         )
 
+        # Generate embeddings for all symbols
+        if symbols:
+            model = get_embedding_model()
+            texts = [
+                f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
+                for s in symbols
+            ]
+            # FastEmbed is CPU bound; run in thread to avoid blocking the event loop
+            embeddings_gen = await asyncio.to_thread(model.embed, texts)
+            embeddings = await asyncio.to_thread(list, embeddings_gen)
+            
+            for s, emb in zip(symbols, embeddings):
+                s["embedding"] = emb.tolist()
+
         # Batch insert symbols
         if symbols:
             await conn.executemany(
                 """
-                INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
                 [
                     (
@@ -138,6 +163,7 @@ async def index_file(file_path: str, session_id: str) -> None:
                         s["end_line"],
                         s["parent"],
                         s["docstring"],
+                        s["embedding"],
                     )
                     for s in symbols
                 ],
