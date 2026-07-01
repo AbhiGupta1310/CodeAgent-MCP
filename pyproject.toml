@@ -13,13 +13,14 @@ dependencies = [
     "tree-sitter-python",
     "tree-sitter-javascript",
     "tree-sitter-typescript",
-    "aiosqlite>=0.20.0",
+    "asyncpg>=0.29.0",
     "watchdog>=4.0.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "python-dotenv>=1.0.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.scripts]

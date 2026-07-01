@@ -1,14 +1,13 @@
 """
 code_server/indexer.py
 ======================
-Tree-sitter AST parser → SQLite symbol index.
+Tree-sitter AST parser → Postgres symbol index.
 Supports Python, JavaScript (JSX), and TypeScript (TSX).
 
 Exports
 -------
-init_db()          — create/migrate the SQLite schema
-index_file(path)   — parse one source file and upsert its symbols
-index_repo(path)   — walk all source files in a repo and index them
+index_file(file_path, session_id)  — parse one source file and upsert its symbols
+index_repo(repo_path, session_id)  — walk all source files in a repo and index them
 """
 
 from __future__ import annotations
@@ -19,11 +18,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
-import aiosqlite
 import tree_sitter_python as tspython
 import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
 from tree_sitter import Language, Node, Parser
+
+from code_server.db import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -73,64 +73,12 @@ def _get_language_for_extension(file_path: str) -> Optional[Language]:
 
 
 # ---------------------------------------------------------------------------
-# Dynamic DB path — resolved at call time, NOT at import time
-# ---------------------------------------------------------------------------
-
-
-def get_db_path(repo_path: str = None) -> str:
-    """Return the absolute path to the SQLite DB for the given repo."""
-    base = repo_path or os.environ.get("CODEAGENT_REPO", ".")
-    return str(Path(base).resolve() / ".codeagent" / "index.db")
-
-
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS symbols (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    kind        TEXT    NOT NULL,      -- 'function' | 'class' | 'method'
-    file_path   TEXT    NOT NULL,
-    start_line  INTEGER NOT NULL,
-    end_line    INTEGER NOT NULL,
-    parent      TEXT,                  -- class name when kind='method', else NULL
-    docstring   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_name ON symbols(name);
-CREATE INDEX IF NOT EXISTS idx_file ON symbols(file_path);
-
-CREATE TABLE IF NOT EXISTS imports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path   TEXT NOT NULL,
-    module      TEXT NOT NULL,         -- top-level module/package imported
-    alias       TEXT,                  -- 'as' alias if present
-    symbol      TEXT                   -- specific name imported (from X import Y)
-);
-CREATE INDEX IF NOT EXISTS idx_import_file ON imports(file_path);
-CREATE INDEX IF NOT EXISTS idx_import_module ON imports(module);
-"""
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-async def init_db(repo_path: str = None) -> None:
-    """Create the database schema (idempotent)."""
-    db_path = get_db_path(repo_path)
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(db_path) as db:
-        await db.executescript(_SCHEMA)
-        await db.commit()
-    logger.debug("DB initialised at %s", db_path)
-
-
-async def index_file(file_path: str, repo_path: str = None) -> None:
-    """Parse *file_path* using its language parser and upsert its symbols into SQLite."""
-    db_path = get_db_path(repo_path)
+async def index_file(file_path: str, session_id: str) -> None:
+    """Parse *file_path* using its language parser and upsert its symbols into Postgres."""
     path = Path(file_path).resolve()
 
     lang = _get_language_for_extension(str(path))
@@ -159,43 +107,72 @@ async def index_file(file_path: str, repo_path: str = None) -> None:
             tree.root_node, source, str(path), symbols, imports, parent_class=None
         )
 
-    async with aiosqlite.connect(db_path) as db:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         # Clean-delete all previous data for this file before re-inserting
-        await db.execute("DELETE FROM symbols WHERE file_path = ?", (str(path),))
-        await db.execute("DELETE FROM imports WHERE file_path = ?", (str(path),))
+        await conn.execute(
+            "DELETE FROM symbols WHERE session_id = $1 AND file_path = $2",
+            session_id,
+            str(path),
+        )
+        await conn.execute(
+            "DELETE FROM imports WHERE session_id = $1 AND file_path = $2",
+            session_id,
+            str(path),
+        )
 
-        await db.executemany(
-            """
-            INSERT INTO symbols (name, kind, file_path, start_line, end_line, parent, docstring)
-            VALUES (:name, :kind, :file_path, :start_line, :end_line, :parent, :docstring)
-            """,
-            symbols,
-        )
-        await db.executemany(
-            """
-            INSERT INTO imports (file_path, module, alias, symbol)
-            VALUES (:file_path, :module, :alias, :symbol)
-            """,
-            imports,
-        )
-        await db.commit()
+        # Batch insert symbols
+        if symbols:
+            await conn.executemany(
+                """
+                INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                """,
+                [
+                    (
+                        session_id,
+                        s["name"],
+                        s["kind"],
+                        s["file_path"],
+                        s["start_line"],
+                        s["end_line"],
+                        s["parent"],
+                        s["docstring"],
+                    )
+                    for s in symbols
+                ],
+            )
+
+        # Batch insert imports
+        if imports:
+            await conn.executemany(
+                """
+                INSERT INTO imports (session_id, file_path, module, alias, symbol)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                [
+                    (
+                        session_id,
+                        imp["file_path"],
+                        imp["module"],
+                        imp["alias"],
+                        imp["symbol"],
+                    )
+                    for imp in imports
+                ],
+            )
 
     logger.debug(
         "Indexed %s → %d symbols, %d imports", path.name, len(symbols), len(imports)
     )
 
 
-async def index_repo(repo_path: str) -> None:
+async def index_repo(repo_path: str, session_id: str) -> None:
     """Walk *repo_path*, find all source files, and index them.
 
     Skips directories in SKIP_DIRS.
-    Always initialises the DB schema first so the database is usable even
-    when no source files are present yet.
     """
     root = Path(repo_path).resolve()
-
-    # Always create / migrate the schema first.
-    await init_db(str(root))
 
     files_to_index: list[Path] = []
 
@@ -219,7 +196,7 @@ async def index_repo(repo_path: str) -> None:
                 files_to_index.append(Path(dirpath) / fname)
 
     if not files_to_index:
-        logger.info("No source files found under %s — schema created, index is empty.", root)
+        logger.info("No source files found under %s — index is empty.", root)
         return
 
     logger.info("Indexing %d source files in %s …", len(files_to_index), root)
@@ -229,7 +206,7 @@ async def index_repo(repo_path: str) -> None:
 
     async def _guarded(p: Path) -> None:
         async with semaphore:
-            await index_file(str(p), str(root))
+            await index_file(str(p), session_id)
 
     await asyncio.gather(*(_guarded(p) for p in files_to_index))
     logger.info("Done indexing %s", root)

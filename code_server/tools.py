@@ -1,11 +1,11 @@
 """
 code_server/tools.py
 ====================
-Four async code-intelligence functions that back the MCP tools.
+Async code-intelligence functions that back the MCP tools.
 
 All functions are pure async — no side effects beyond reads.
-All DB-touching functions accept an optional repo_path; the DB path is
-resolved at call time via get_db_path(), NEVER at import time.
+All DB-touching functions accept a session_id and query Postgres
+via the shared asyncpg pool from db.py.
 """
 
 from __future__ import annotations
@@ -15,48 +15,44 @@ import os
 import re
 from pathlib import Path
 
-import aiosqlite
-
-from code_server.indexer import SKIP_DIRS, get_db_path
+from code_server.db import get_pool
+from code_server.indexer import SKIP_DIRS
 
 # ---------------------------------------------------------------------------
 # 1.  find_function — symbol search
 # ---------------------------------------------------------------------------
 
 
-async def find_function(query: str, repo_path: str = None) -> list[dict]:
+async def find_function(query: str, session_id: str) -> list[dict]:
     """Search the symbol index for names containing *query*.
 
-    SQL: SELECT * FROM symbols WHERE name LIKE '%query%' LIMIT 20
+    SQL: SELECT * FROM symbols WHERE session_id = $1 AND name ILIKE $2 LIMIT 20
 
     Parameters
     ----------
     query:
         Partial or full symbol name to search for.
-    repo_path:
-        Root of the repository whose index to query. Resolved at call time
-        via get_db_path(); defaults to CODEAGENT_REPO env var or ".".
+    session_id:
+        Session ID to scope the query to.
 
     Returns
     -------
     list of {name, kind, file_path, start_line, end_line, parent, docstring}
     """
-    db_path = get_db_path(repo_path)
+    pool = await get_pool()
     pattern = f"%{query}%"
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
             """
             SELECT name, kind, file_path, start_line, end_line, parent, docstring
             FROM   symbols
-            WHERE  name LIKE ?
+            WHERE  session_id = $1 AND name ILIKE $2
             ORDER  BY kind, name
             LIMIT  20
             """,
-            (pattern,),
+            session_id,
+            pattern,
         )
-        rows = await cur.fetchall()
-
     return [dict(row) for row in rows]
 
 
@@ -65,7 +61,7 @@ async def find_function(query: str, repo_path: str = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def list_symbols(kind: str = "all", repo_path: str = None) -> list[dict]:
+async def list_symbols(kind: str = "all", session_id: str = "") -> list[dict]:
     """Return all indexed symbols, optionally filtered by *kind*.
 
     Parameters
@@ -74,40 +70,40 @@ async def list_symbols(kind: str = "all", repo_path: str = None) -> list[dict]:
         One of ``'class'``, ``'function'``, ``'method'``, or ``'all'``
         (default).  Filtering by kind is far more reliable than guessing
         names for broad questions like "list all classes".
-    repo_path:
-        Root of the repository whose index to query.
+    session_id:
+        Session ID to scope the query to.
 
     Returns
     -------
     list of {name, kind, file_path, start_line, end_line, parent, docstring}
     """
-    db_path = get_db_path(repo_path)
+    pool = await get_pool()
     valid_kinds = {"class", "function", "method"}
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
+    async with pool.acquire() as conn:
         if kind in valid_kinds:
-            cur = await db.execute(
+            rows = await conn.fetch(
                 """
                 SELECT name, kind, file_path, start_line, end_line, parent, docstring
                 FROM   symbols
-                WHERE  kind = ?
+                WHERE  session_id = $1 AND kind = $2
                 ORDER  BY file_path, start_line
                 LIMIT  100
                 """,
-                (kind,),
+                session_id,
+                kind,
             )
         else:
             # "all" or unrecognised — return everything
-            cur = await db.execute(
+            rows = await conn.fetch(
                 """
                 SELECT name, kind, file_path, start_line, end_line, parent, docstring
                 FROM   symbols
+                WHERE  session_id = $1
                 ORDER  BY kind, file_path, start_line
                 LIMIT  100
-                """
+                """,
+                session_id,
             )
-        rows = await cur.fetchall()
-
     return [dict(row) for row in rows]
 
 
@@ -116,7 +112,9 @@ async def list_symbols(kind: str = "all", repo_path: str = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def get_callers(function_name: str, repo_path: str = None) -> list[dict]:
+async def get_callers(
+    function_name: str, session_id: str, repo_path: str
+) -> list[dict]:
     """Scan all source files in *repo_path* for lines containing ``function_name(``.
 
     Uses asyncio to read files concurrently (semaphore-limited).
@@ -125,15 +123,16 @@ async def get_callers(function_name: str, repo_path: str = None) -> list[dict]:
     ----------
     function_name:
         Exact name of the function to search for callers of.
+    session_id:
+        Session ID (used for context, not directly for grep).
     repo_path:
-        Root of the repository to grep. Defaults to CODEAGENT_REPO env var
-        or "." — resolved at call time.
+        Root of the repository to grep.
 
     Returns
     -------
     list of {file, line, snippet}   (capped at 30 results)
     """
-    root = Path(repo_path or os.environ.get("CODEAGENT_REPO", ".")).resolve()
+    root = Path(repo_path).resolve()
     pattern = re.compile(re.escape(function_name) + r"\s*\(")
 
     results: list[dict] = []
@@ -235,41 +234,33 @@ async def read_file_slice(
 
 
 # ---------------------------------------------------------------------------
-# 4.  list_imports — import statement extractor
+# 4.  list_imports — import query from Postgres
 # ---------------------------------------------------------------------------
 
-_PY_IMPORT_RE = re.compile(r"^\s*(from\s+\S+\s+import\s+.+|import\s+.+)")
-_JS_IMPORT_RE = re.compile(
-    r"^\s*(import\s+.+|const\s+\S+\s*=\s*require\(.+|let\s+\S+\s*=\s*require\(.+|var\s+\S+\s*=\s*require\(.+)"
-)
 
+async def list_imports(file_path: str, session_id: str) -> list[dict]:
+    """Return every import record for *file_path* from the Postgres index.
 
-async def list_imports(file_path: str) -> list[dict]:
-    """Return every import statement found in *file_path*.
-
-    Scans line-by-line with a regex; does NOT parse the AST (fast, works on
-    files not yet indexed).
+    Parameters
+    ----------
+    file_path:
+        Absolute or relative path to the source file.
+    session_id:
+        Session ID to scope the query to.
 
     Returns
     -------
-    list of {line: int, statement: str}
+    list of {file_path, module, alias, symbol}
     """
-    path = Path(file_path).resolve()
-    ext = path.suffix.lower()
-    is_js_ts = ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts")
-    import_re = _JS_IMPORT_RE if is_js_ts else _PY_IMPORT_RE
-
-    try:
-        content = await asyncio.to_thread(
-            path.read_text, encoding="utf-8", errors="ignore"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT file_path, module, alias, symbol
+            FROM   imports
+            WHERE  session_id = $1 AND file_path = $2
+            """,
+            session_id,
+            file_path,
         )
-    except OSError as exc:
-        return [{"line": 0, "statement": f"ERROR: cannot read {file_path}: {exc}"}]
-
-    results: list[dict] = []
-    for lineno, raw in enumerate(content.splitlines(), start=1):
-        m = import_re.match(raw)
-        if m:
-            results.append({"line": lineno, "statement": raw.strip()})
-
-    return results
+    return [dict(row) for row in rows]

@@ -1,0 +1,7 @@
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+startCommand = "python -m code_server.server"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
