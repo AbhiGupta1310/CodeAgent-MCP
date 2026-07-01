@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -54,7 +55,26 @@ logger = logging.getLogger(__name__)
 # Server instance
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("codeagent-code-server", host="0.0.0.0", port=8000)
+@asynccontextmanager
+async def app_lifespan(server: FastMCP):
+    await init_schema()
+    logger.info("Postgres schema initialized at startup")
+
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(60 * 60)  # every hour
+            try:
+                count = await cleanup_expired_sessions()
+                if count:
+                    logger.info("Cleaned up %d expired sessions", count)
+            except Exception as exc:
+                logger.warning("Session cleanup failed: %s", exc)
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    yield
+    cleanup_task.cancel()
+
+mcp = FastMCP("codeagent-code-server", host="0.0.0.0", port=8000, lifespan=app_lifespan)
 
 # ---------------------------------------------------------------------------
 # Helper: validate session
@@ -326,9 +346,7 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Initialize schema before starting the server
-    asyncio.run(init_schema())
-    logger.info("Postgres schema initialized at startup")
+
 
     logger.info("Starting codeagent-code-server (SSE transport on 0.0.0.0:8000)…")
     mcp.run(transport="sse")
