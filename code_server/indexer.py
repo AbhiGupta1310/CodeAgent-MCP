@@ -144,7 +144,7 @@ async def index_file(file_path: str, session_id: str) -> None:
             embeddings = await asyncio.to_thread(list, embeddings_gen)
             
             for s, emb in zip(symbols, embeddings):
-                s["embedding"] = emb.tolist()
+                s["embedding"] = str(emb.tolist())
 
         # Batch insert symbols
         if symbols:

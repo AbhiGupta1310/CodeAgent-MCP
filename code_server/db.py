@@ -96,6 +96,10 @@ CREATE INDEX IF NOT EXISTS idx_session_name
     ON symbols(session_id, name);
 CREATE INDEX IF NOT EXISTS idx_session_file
     ON symbols(session_id, file_path);
+
+-- Ensure the column exists for users migrating from older versions
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS embedding vector(384);
+
 CREATE INDEX IF NOT EXISTS idx_symbol_embedding
     ON symbols USING hnsw (embedding vector_cosine_ops);
 
