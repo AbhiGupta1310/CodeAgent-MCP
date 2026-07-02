@@ -2,7 +2,7 @@
 
 A powerful, hosted **Model Context Protocol (MCP)** server that gives LLMs (like Claude, Cursor, and Windsurf) the ability to understand, navigate, and query any public GitHub repository.
 
-CodeAgent clones the repository, indexes it using **tree-sitter**, generates **local vector embeddings** via FastEmbed, and exposes a suite of advanced code-intelligence tools via **Server-Sent Events (SSE)**.
+CodeAgent clones the repository, indexes it using **tree-sitter**, generates **local vector embeddings** via FastEmbed, and exposes a suite of advanced code-intelligence tools via **Streamable HTTP**.
 
 ---
 
@@ -29,7 +29,7 @@ graph TD
     end
 
     subgraph CodeAgent [CodeAgent Server]
-        FastMCP[FastMCP SSE Server]
+        FastMCP[FastMCP Server]
         SessionMgr[Session Manager]
         Indexer[Tree-Sitter + FastEmbed]
         Tools[Code Intelligence Tools]
@@ -40,7 +40,7 @@ graph TD
         Disk[(Local Disk /tmp)]
     end
 
-    LLM <-->|1. SSE Transport| FastMCP
+    LLM <-->|1. Streamable HTTP Transport| FastMCP
     FastMCP -->|2. Route Request| SessionMgr
     FastMCP -->|4. Execute Tool| Tools
     
@@ -55,7 +55,7 @@ graph TD
 ```
 
 ### Components
-- **FastMCP (SSE):** The transport layer. Listens for HTTP requests and maintains a streaming connection with the LLM.
+- **FastMCP (Streamable HTTP):** The transport layer. Listens for HTTP requests at `/mcp` and maintains a streaming connection with the LLM.
 - **Tree-Sitter + FastEmbed Indexer:** Scans the codebase, understands syntax (Python, JS, TS), extracts symbols, and generates local embeddings using the `BAAI/bge-small-en-v1.5` model (100% free, runs on CPU).
 - **Postgres + pgvector:** Stores relational metadata and vector embeddings for lightning-fast semantic querying.
 
@@ -84,9 +84,9 @@ Want to try it immediately? Add our public hosted endpoint to your MCP client!
 
 ### Using Claude Desktop
 1. Open Claude Desktop.
-2. Go to **Settings (Gear Icon) → Connectors**.
-3. Click **Add Connector** → **Add Custom Connector**.
-4. Enter the Server URL: `https://codeagent-mcp.onrender.com/sse`
+2. Go to **Settings (Gear Icon) → Connectors** (or Edit `claude_desktop_config.json`).
+3. Click **Add Connector** → **Add Custom Connector** (or configure custom MCP HTTP endpoint).
+4. Enter the Server URL: `https://codeagent-mcp.onrender.com/mcp`
 5. Click **Connect**.
 
 *Note: Claude Web (Chrome/Safari) does not support MCP yet. You must use the Claude Desktop macOS/Windows app.*
@@ -94,8 +94,8 @@ Want to try it immediately? Add our public hosted endpoint to your MCP client!
 ### Using Cursor
 1. Go to **Cursor Settings → Features → MCP**.
 2. Click **Add New MCP Server**.
-3. Choose **SSE** as the transport.
-4. Enter URL: `https://codeagent-mcp.onrender.com/sse`
+3. Choose **Streamable HTTP / HTTP** as the transport.
+4. Enter URL: `https://codeagent-mcp.onrender.com/mcp`
 
 **Example "Mind-Blowing" Prompt:**
 > "Index this repo: https://github.com/pallets/flask. Then, use the architecture tool to draw the complete class diagram. Finally, use semantic search to find where they handle request parsing."
@@ -131,7 +131,7 @@ cp .env.example .env
 Run the server locally:
 ```bash
 python -m code_server.server
-# Server will start at http://0.0.0.0:8000/sse
+# Server will start at http://0.0.0.0:8000/mcp
 ```
 
 ### 2. Deploy to Railway or Render (Free Tier)
@@ -151,7 +151,7 @@ We love contributions! If you want to make CodeAgent smarter, faster, or add sup
 1. **Fork the repo** and create your branch from `main`.
 2. **Set up locally** using the *Local Development Setup* instructions above.
 3. **Make your changes**. Ensure your code is well-commented and clean.
-4. **Test your changes** by running the server locally and connecting your own Claude Desktop to `http://localhost:8000/sse`.
+4. **Test your changes** by running the server locally and connecting your own Claude Desktop / Cursor to `http://localhost:8000/mcp`.
 5. **Issue a Pull Request**.
 
 ### Areas to Improve (Ideas for PRs)

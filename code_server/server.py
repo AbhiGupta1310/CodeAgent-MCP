@@ -406,5 +406,5 @@ if __name__ == "__main__":
 
 
     logger.info("Starting codeagent-code-server (SSE transport on 0.0.0.0:8000)…")
-    mcp.run(transport="sse")
+    mcp.run(transport="streamable-http")
 
