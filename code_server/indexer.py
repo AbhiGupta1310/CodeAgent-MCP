@@ -88,21 +88,19 @@ def _get_language_for_extension(file_path: str) -> Optional[Language]:
 # ---------------------------------------------------------------------------
 
 
-async def index_file(file_path: str, session_id: str) -> None:
-    """Parse *file_path* using its language parser and upsert its symbols into Postgres."""
+def parse_file_ast(file_path: str) -> tuple[list[dict], list[dict]]:
+    """Parse source file into AST and extract symbols and imports in-memory."""
     path = Path(file_path).resolve()
-
     lang = _get_language_for_extension(str(path))
     if not lang:
-        return  # Unsupported file type
+        return [], []
 
     try:
         source = path.read_bytes()
     except OSError as exc:
         logger.warning("Cannot read %s: %s", file_path, exc)
-        return
+        return [], []
 
-    # Create local thread-safe parser instance
     parser = Parser(lang)
     tree = parser.parse(source)
 
@@ -118,85 +116,93 @@ async def index_file(file_path: str, session_id: str) -> None:
             tree.root_node, source, str(path), symbols, imports, parent_class=None
         )
 
+    return symbols, imports
+
+
+def generate_embeddings_batch(symbols: list[dict]) -> None:
+    """Generate FastEmbed embeddings for a batch of symbols in-place."""
+    if not symbols:
+        return
+    model = get_embedding_model()
+    texts = [
+        f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
+        for s in symbols
+    ]
+    embeddings_gen = model.embed(texts, batch_size=64)
+    embeddings = list(embeddings_gen)
+    for s, emb in zip(symbols, embeddings):
+        s["embedding"] = str(emb.tolist())
+
+
+async def index_file(file_path: str, session_id: str) -> None:
+    """Parse *file_path* using its language parser and upsert its symbols into Postgres."""
+    symbols, imports = parse_file_ast(file_path)
+    if not symbols and not imports:
+        return
+
+    if symbols:
+        await asyncio.to_thread(generate_embeddings_batch, symbols)
+
+    path_str = str(Path(file_path).resolve())
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Clean-delete all previous data for this file before re-inserting
-        await conn.execute(
-            "DELETE FROM symbols WHERE session_id = $1 AND file_path = $2",
-            session_id,
-            str(path),
-        )
-        await conn.execute(
-            "DELETE FROM imports WHERE session_id = $1 AND file_path = $2",
-            session_id,
-            str(path),
-        )
-
-        # Generate embeddings for all symbols
-        if symbols:
-            model = get_embedding_model()
-            texts = [
-                f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
-                for s in symbols
-            ]
-            # FastEmbed is CPU bound; run in thread to avoid blocking the event loop
-            embeddings_gen = await asyncio.to_thread(model.embed, texts)
-            embeddings = await asyncio.to_thread(list, embeddings_gen)
-            
-            for s, emb in zip(symbols, embeddings):
-                s["embedding"] = str(emb.tolist())
-
-        # Batch insert symbols
-        if symbols:
-            await conn.executemany(
-                """
-                INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                """,
-                [
-                    (
-                        session_id,
-                        s["name"],
-                        s["kind"],
-                        s["file_path"],
-                        s["start_line"],
-                        s["end_line"],
-                        s["parent"],
-                        s["docstring"],
-                        s["embedding"],
-                    )
-                    for s in symbols
-                ],
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM symbols WHERE session_id = $1 AND file_path = $2",
+                session_id,
+                path_str,
+            )
+            await conn.execute(
+                "DELETE FROM imports WHERE session_id = $1 AND file_path = $2",
+                session_id,
+                path_str,
             )
 
-        # Batch insert imports
-        if imports:
-            await conn.executemany(
-                """
-                INSERT INTO imports (session_id, file_path, module, alias, symbol)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                [
-                    (
-                        session_id,
-                        imp["file_path"],
-                        imp["module"],
-                        imp["alias"],
-                        imp["symbol"],
-                    )
-                    for imp in imports
-                ],
-            )
+            if symbols:
+                await conn.executemany(
+                    """
+                    INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                    [
+                        (
+                            session_id,
+                            s["name"],
+                            s["kind"],
+                            s["file_path"],
+                            s["start_line"],
+                            s["end_line"],
+                            s["parent"],
+                            s["docstring"],
+                            s.get("embedding"),
+                        )
+                        for s in symbols
+                    ],
+                )
 
-    logger.debug(
-        "Indexed %s → %d symbols, %d imports", path.name, len(symbols), len(imports)
-    )
+            if imports:
+                await conn.executemany(
+                    """
+                    INSERT INTO imports (session_id, file_path, module, alias, symbol)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    [
+                        (
+                            session_id,
+                            imp["file_path"],
+                            imp["module"],
+                            imp["alias"],
+                            imp["symbol"],
+                        )
+                        for imp in imports
+                    ],
+                )
 
 
 async def index_repo(repo_path: str, session_id: str) -> None:
-    """Walk *repo_path*, find all source files, and index them.
-
-    Skips directories in SKIP_DIRS.
+    """Walk *repo_path*, parse all source files into symbols & imports,
+    generate vector embeddings in a single repository-wide batch, and bulk-insert
+    all data into Postgres inside a single transaction.
     """
     root = Path(repo_path).resolve()
 
@@ -225,17 +231,81 @@ async def index_repo(repo_path: str, session_id: str) -> None:
         logger.info("No source files found under %s — index is empty.", root)
         return
 
-    logger.info("Indexing %d source files in %s …", len(files_to_index), root)
+    logger.info("Parsing %d source files in %s …", len(files_to_index), root)
 
-    # Index concurrently (batched to avoid too many open file handles)
-    semaphore = asyncio.Semaphore(16)
+    # 1. Parse all ASTs in parallel in-memory
+    def _parse_all() -> tuple[list[dict], list[dict]]:
+        syms: list[dict] = []
+        imps: list[dict] = []
+        for p in files_to_index:
+            s_list, i_list = parse_file_ast(str(p))
+            syms.extend(s_list)
+            imps.extend(i_list)
+        return syms, imps
 
-    async def _guarded(p: Path) -> None:
-        async with semaphore:
-            await index_file(str(p), session_id)
+    all_symbols, all_imports = await asyncio.to_thread(_parse_all)
 
-    await asyncio.gather(*(_guarded(p) for p in files_to_index))
-    logger.info("Done indexing %s", root)
+    logger.info(
+        "Extracted %d symbols and %d imports across %d files.",
+        len(all_symbols),
+        len(all_imports),
+        len(files_to_index),
+    )
+
+    # 2. Vectorized Batch Embeddings for all symbols across the repository
+    if all_symbols:
+        logger.info("Generating embeddings for %d symbols in vectorized batch pass...", len(all_symbols))
+        await asyncio.to_thread(generate_embeddings_batch, all_symbols)
+
+    # 3. Single Bulk Database Transaction over 1 Connection
+    logger.info("Writing symbols and imports to database in a single transaction...")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM symbols WHERE session_id = $1", session_id)
+            await conn.execute("DELETE FROM imports WHERE session_id = $1", session_id)
+
+            if all_symbols:
+                await conn.executemany(
+                    """
+                    INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    """,
+                    [
+                        (
+                            session_id,
+                            s["name"],
+                            s["kind"],
+                            s["file_path"],
+                            s["start_line"],
+                            s["end_line"],
+                            s["parent"],
+                            s["docstring"],
+                            s.get("embedding"),
+                        )
+                        for s in all_symbols
+                    ],
+                )
+
+            if all_imports:
+                await conn.executemany(
+                    """
+                    INSERT INTO imports (session_id, file_path, module, alias, symbol)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    [
+                        (
+                            session_id,
+                            imp["file_path"],
+                            imp["module"],
+                            imp["alias"],
+                            imp["symbol"],
+                        )
+                        for imp in all_imports
+                    ],
+                )
+
+    logger.info("Done indexing %s in single bulk pass.", root)
 
 
 # ---------------------------------------------------------------------------

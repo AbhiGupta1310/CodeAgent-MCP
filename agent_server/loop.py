@@ -125,6 +125,40 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "semantic_search",
+            "description": (
+                "Search for concepts or natural language queries in the indexed codebase "
+                "using vector similarity search (pgvector)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language concept to search for (e.g. 'user login logic')",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_architecture",
+            "description": (
+                "Generate a Mermaid.js class diagram illustrating the object-oriented "
+                "architecture and class inheritance relationships in the codebase."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "final_answer",
             "description": (
                 "Call this ONLY when you have a complete, thorough answer. "
@@ -155,12 +189,13 @@ AGENT_SYSTEM_PROMPT = """You are CodeAgent, an expert code analysis AI.
 You have tools to explore a codebase. Use them methodically to answer the user's question.
 
 STRATEGY:
-1. Start with search_symbols to find relevant functions/classes by name
+1. Start with search_symbols or semantic_search to find relevant functions/classes
 2. Use read_code to read the actual implementation (use start_line and end_line from search results)
 3. Use find_callers to trace who calls a function
 4. Use get_imports to understand a file's dependencies
-5. Keep exploring until you fully understand the flow
-6. Call final_answer with a detailed, well-structured answer that includes file paths and line numbers
+5. Use generate_architecture for high-level class diagrams
+6. Keep exploring until you fully understand the flow
+7. Call final_answer with a detailed, well-structured answer that includes file paths and line numbers
 
 RULES:
 - Never guess — read the actual code before drawing conclusions
@@ -174,7 +209,9 @@ RULES:
 # ---------------------------------------------------------------------------
 
 
-async def run_agent_loop(task: str, max_iterations: int = 30) -> str:
+async def run_agent_loop(
+    task: str, session_id: str = "", max_iterations: int = 30
+) -> str:
     """Run the main agentic code-reasoning loop against OpenRouter.
 
     Loops up to *max_iterations* times, driving Claude via OpenRouter and
@@ -261,7 +298,7 @@ async def run_agent_loop(task: str, max_iterations: int = 30) -> str:
                 break
 
             # Execute the tool on the local filesystem / database index
-            result = await _execute_tool(fn_name, fn_args)
+            result = await _execute_tool(fn_name, fn_args, session_id=session_id)
 
             # Safeguard context size by truncating extremely long tool outputs
             if len(result) > 6000:
@@ -287,7 +324,9 @@ async def run_agent_loop(task: str, max_iterations: int = 30) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _execute_tool(name: str, args: dict[str, Any]) -> str:
+async def _execute_tool(
+    name: str, args: dict[str, Any], session_id: str = ""
+) -> str:
     """Route tool call execution to the underlying code server tools."""
     from code_server import tools as ct
 
@@ -296,17 +335,17 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> str:
     try:
         if name == "search_symbols":
             query = args.get("query", "")
-            result = await ct.find_function(query)
+            result = await ct.find_function(query, session_id=session_id)
             return json.dumps(result, indent=2)
 
         elif name == "list_symbols":
             kind = args.get("kind", "all")
-            result = await ct.list_symbols(kind=kind, repo_path=repo)
+            result = await ct.list_symbols(kind=kind, session_id=session_id)
             return json.dumps(result, indent=2)
 
         elif name == "find_callers":
             func_name = args.get("function_name", "")
-            result = await ct.get_callers(func_name, repo)
+            result = await ct.get_callers(func_name, session_id, repo)
             return json.dumps(result, indent=2)
 
         elif name == "read_code":
@@ -317,7 +356,15 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> str:
 
         elif name == "get_imports":
             file_path = args.get("file_path", "")
-            result = await ct.list_imports(file_path)
+            result = await ct.list_imports(file_path, session_id=session_id)
+            return json.dumps(result, indent=2)
+
+        elif name == "generate_architecture":
+            return await ct.generate_architecture(session_id=session_id)
+
+        elif name == "semantic_search":
+            query = args.get("query", "")
+            result = await ct.semantic_search(query, session_id=session_id)
             return json.dumps(result, indent=2)
 
         else:
