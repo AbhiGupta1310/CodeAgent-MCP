@@ -329,7 +329,7 @@ async def semantic_search(query: str, session_id: str) -> list[dict]:
             import httpx
 
             headers = {"Authorization": f"Bearer {hf_token}"}
-            url = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5"
+            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
             payload = {"inputs": [query], "options": {"wait_for_model": True}}
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(url, headers=headers, json=payload)

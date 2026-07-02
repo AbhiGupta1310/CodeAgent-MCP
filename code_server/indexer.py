@@ -120,10 +120,10 @@ def parse_file_ast(file_path: str) -> tuple[list[dict], list[dict]]:
 
 
 async def generate_embeddings_batch(symbols: list[dict]) -> None:
-    """Generate 384-dim vector embeddings via Hugging Face Serverless Inference API.
+    """Generate 384-dim vector embeddings via Hugging Face API or OpenRouter API.
 
-    Uses HF_TOKEN to hit Hugging Face's inference API for 0% CPU & 0 MB RAM overhead.
-    Falls back to local FastEmbed if HF_TOKEN is unavailable or network request fails.
+    Uses cloud API embeddings to eliminate CPU/RAM usage on cloud servers (Render/Railway).
+    Falls back to local FastEmbed with low batch size if no API key is available.
     """
     if not symbols:
         return
@@ -133,7 +133,10 @@ async def generate_embeddings_batch(symbols: list[dict]) -> None:
         for s in symbols
     ]
 
-    hf_token = os.environ.get("HF_TOKEN")
+    hf_token = os.environ.get("HF_TOKEN", "").strip()
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+
+    # Tier 1: Hugging Face Inference API
     if hf_token:
         try:
             import httpx
@@ -143,9 +146,8 @@ async def generate_embeddings_batch(symbols: list[dict]) -> None:
                 len(symbols),
             )
             headers = {"Authorization": f"Bearer {hf_token}"}
-            url = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5"
+            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
 
-            # Batch HTTP requests in chunks of 32
             batch_size = 32
             all_embeddings: list[list[float]] = []
 
@@ -166,12 +168,55 @@ async def generate_embeddings_batch(symbols: list[dict]) -> None:
             return
         except Exception as exc:
             logger.warning(
-                "Hugging Face API request failed, falling back to local FastEmbed: %s",
-                exc,
+                "Hugging Face API request failed, trying OpenRouter fallback: %s", exc
             )
 
-    # Fallback to local FastEmbed (with low batch_size=16 to prevent Render 512MB RAM OOM)
-    logger.info("Generating embeddings locally via FastEmbed (batch_size=16) ...")
+    # Tier 2: OpenRouter API
+    if openrouter_key:
+        try:
+            import httpx
+
+            logger.info(
+                "Generating embeddings via OpenRouter API (%d symbols, 0%% CPU, 0 MB RAM) ...",
+                len(symbols),
+            )
+            headers = {
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+            }
+            batch_size = 64
+            all_embeddings = []
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for i in range(0, len(texts), batch_size):
+                    chunk_texts = texts[i : i + batch_size]
+                    payload = {
+                        "model": "openai/text-embedding-3-small",
+                        "input": chunk_texts,
+                        "dimensions": 384,
+                    }
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/embeddings",
+                        headers=headers,
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    chunk_embs = [item["embedding"] for item in data["data"]]
+                    all_embeddings.extend(chunk_embs)
+
+            for s, emb in zip(symbols, all_embeddings):
+                s["embedding"] = str(emb)
+            return
+        except Exception as exc:
+            logger.warning(
+                "OpenRouter API request failed, falling back to local FastEmbed: %s", exc
+            )
+
+    # Tier 3: Local FastEmbed fallback
+    logger.info(
+        "No HF_TOKEN or OPENROUTER_API_KEY set. Generating embeddings locally via FastEmbed (batch_size=16) ..."
+    )
     model = get_embedding_model()
     embeddings_gen = await asyncio.to_thread(model.embed, texts, batch_size=16)
     embeddings = await asyncio.to_thread(list, embeddings_gen)
