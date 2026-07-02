@@ -119,17 +119,62 @@ def parse_file_ast(file_path: str) -> tuple[list[dict], list[dict]]:
     return symbols, imports
 
 
-def generate_embeddings_batch(symbols: list[dict]) -> None:
-    """Generate FastEmbed embeddings for a batch of symbols in-place."""
+async def generate_embeddings_batch(symbols: list[dict]) -> None:
+    """Generate 384-dim vector embeddings via Hugging Face Serverless Inference API.
+
+    Uses HF_TOKEN to hit Hugging Face's inference API for 0% CPU & 0 MB RAM overhead.
+    Falls back to local FastEmbed if HF_TOKEN is unavailable or network request fails.
+    """
     if not symbols:
         return
-    model = get_embedding_model()
+
     texts = [
         f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
         for s in symbols
     ]
-    embeddings_gen = model.embed(texts, batch_size=64)
-    embeddings = list(embeddings_gen)
+
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        try:
+            import httpx
+
+            logger.info(
+                "Generating embeddings via Hugging Face API (%d symbols, 0%% CPU, 0 MB RAM) ...",
+                len(symbols),
+            )
+            headers = {"Authorization": f"Bearer {hf_token}"}
+            url = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5"
+
+            # Batch HTTP requests in chunks of 32
+            batch_size = 32
+            all_embeddings: list[list[float]] = []
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                for i in range(0, len(texts), batch_size):
+                    chunk_texts = texts[i : i + batch_size]
+                    payload = {
+                        "inputs": chunk_texts,
+                        "options": {"wait_for_model": True},
+                    }
+                    resp = await client.post(url, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    chunk_embs = resp.json()
+                    all_embeddings.extend(chunk_embs)
+
+            for s, emb in zip(symbols, all_embeddings):
+                s["embedding"] = str(emb)
+            return
+        except Exception as exc:
+            logger.warning(
+                "Hugging Face API request failed, falling back to local FastEmbed: %s",
+                exc,
+            )
+
+    # Fallback to local FastEmbed (with low batch_size=16 to prevent Render 512MB RAM OOM)
+    logger.info("Generating embeddings locally via FastEmbed (batch_size=16) ...")
+    model = get_embedding_model()
+    embeddings_gen = await asyncio.to_thread(model.embed, texts, batch_size=16)
+    embeddings = await asyncio.to_thread(list, embeddings_gen)
     for s, emb in zip(symbols, embeddings):
         s["embedding"] = str(emb.tolist())
 
@@ -141,7 +186,7 @@ async def index_file(file_path: str, session_id: str) -> None:
         return
 
     if symbols:
-        await asyncio.to_thread(generate_embeddings_batch, symbols)
+        await generate_embeddings_batch(symbols)
 
     path_str = str(Path(file_path).resolve())
     pool = await get_pool()
@@ -255,7 +300,7 @@ async def index_repo(repo_path: str, session_id: str) -> None:
     # 2. Vectorized Batch Embeddings for all symbols across the repository
     if all_symbols:
         logger.info("Generating embeddings for %d symbols in vectorized batch pass...", len(all_symbols))
-        await asyncio.to_thread(generate_embeddings_batch, all_symbols)
+        await generate_embeddings_batch(all_symbols)
 
     # 3. Single Bulk Database Transaction over 1 Connection
     logger.info("Writing symbols and imports to database in a single transaction...")

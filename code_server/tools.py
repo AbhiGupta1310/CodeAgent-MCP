@@ -319,26 +319,60 @@ async def generate_architecture(session_id: str) -> str:
 
 
 async def semantic_search(query: str, session_id: str) -> list[dict]:
-    """Search for concepts using pgvector cosine similarity.
+    """Search for concepts using pgvector cosine similarity."""
+    hf_token = os.environ.get("HF_TOKEN")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    query_vector = None
 
-    Parameters
-    ----------
-    query:
-        The natural language concept to search for (e.g. 'password hashing').
-    session_id:
-        Session ID to scope the query to.
+    if hf_token:
+        try:
+            import httpx
 
-    Returns
-    -------
-    list of {name, kind, file_path, start_line, docstring, similarity}
-    """
-    from code_server.indexer import get_embedding_model
+            headers = {"Authorization": f"Bearer {hf_token}"}
+            url = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-small-en-v1.5"
+            payload = {"inputs": [query], "options": {"wait_for_model": True}}
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                embs = resp.json()
+                query_vector = embs[0]
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("HF API query embedding failed: %s", exc)
 
-    model = get_embedding_model()
-    # Embed the query
-    embeddings_gen = await asyncio.to_thread(model.embed, [query])
-    embeddings = await asyncio.to_thread(list, embeddings_gen)
-    query_vector = embeddings[0].tolist()
+    elif api_key:
+        try:
+            import httpx
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": "openai/text-embedding-3-small",
+                "input": [query],
+                "dimensions": 384,
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/embeddings",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                query_vector = data["data"][0]["embedding"]
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("OpenRouter API query embedding failed: %s", exc)
+
+    if query_vector is None:
+        from code_server.indexer import get_embedding_model
+
+        model = get_embedding_model()
+        embeddings_gen = await asyncio.to_thread(model.embed, [query])
+        embeddings = await asyncio.to_thread(list, embeddings_gen)
+        query_vector = embeddings[0].tolist()
 
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -352,7 +386,7 @@ async def semantic_search(query: str, session_id: str) -> list[dict]:
             LIMIT  10
             """,
             session_id,
-            str(query_vector)
+            str(query_vector),
         )
     return [dict(row) for row in rows]
 
