@@ -28,6 +28,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from code_server.db import init_schema
 from code_server.indexer import index_repo
@@ -77,6 +79,15 @@ async def app_lifespan(server: FastMCP):
     cleanup_task.cancel()
 
 mcp = FastMCP("codeagent-code-server", host="0.0.0.0", port=8000, lifespan=app_lifespan)
+
+# ---------------------------------------------------------------------------
+# Health Check Endpoint
+# ---------------------------------------------------------------------------
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    """Health check endpoint for deployment monitoring (Railway / Docker)."""
+    return JSONResponse({"status": "ok"})
 
 # ---------------------------------------------------------------------------
 # Helper: validate session
