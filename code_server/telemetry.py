@@ -109,7 +109,7 @@ def setup_telemetry() -> None:
                 traces_url = f"{traces_url}/v1/traces"
 
             span_exporter = OTLPSpanExporter(endpoint=traces_url, headers=headers_dict) if headers_dict else OTLPSpanExporter(endpoint=traces_url)
-            _tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter, scheduled_delay_millis=2000))
+            _tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter, schedule_delay_millis=2000))
             logger.info("OTLP Trace Exporter initialized (target: %s)", traces_url)
         except Exception as e:
             logger.warning("Failed to initialize OTLPSpanExporter: %s", e)
