@@ -50,6 +50,12 @@ from code_server.tools import (
     generate_architecture,
     semantic_search,
 )
+from code_server.telemetry import (
+    setup_telemetry,
+    track_tool,
+    get_local_stats,
+    StatsMiddleware,
+)
 
 load_dotenv()
 
@@ -61,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
+    setup_telemetry()
     await init_schema()
     logger.info("Postgres schema initialized at startup")
 
@@ -81,13 +88,19 @@ async def app_lifespan(server: FastMCP):
 mcp = FastMCP("codeagent-code-server", host="0.0.0.0", port=8000, lifespan=app_lifespan)
 
 # ---------------------------------------------------------------------------
-# Health Check Endpoint
+# Health & Stats Monitoring Endpoints
 # ---------------------------------------------------------------------------
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
-    """Health check endpoint for deployment monitoring (Railway / Docker)."""
+    """Health check endpoint for deployment monitoring (Railway / Docker / Render)."""
     return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/stats", methods=["GET"])
+async def stats_endpoint(request: Request) -> JSONResponse:
+    """Real-time monitoring stats endpoint returning HTTP & MCP tool metrics."""
+    return JSONResponse(get_local_stats())
 
 # ---------------------------------------------------------------------------
 # Helper: validate session
@@ -110,6 +123,7 @@ async def _validate_session(session_id: str) -> str | None:
 
 
 @mcp.tool()
+@track_tool("index_github_repo")
 async def index_github_repo(github_url: str) -> str:
     """Clone a public GitHub repository and index it for analysis.
     Returns a session_id that must be passed to all subsequent tool calls.
@@ -187,6 +201,7 @@ async def index_github_repo(github_url: str) -> str:
 
 
 @mcp.tool()
+@track_tool("search_symbols")
 async def search_symbols(query: str, session_id: str) -> str:
     """Search the symbol index for functions, classes, and methods whose
     names contain *query* (case-insensitive ILIKE match).
@@ -216,6 +231,7 @@ async def search_symbols(query: str, session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("list_all_symbols")
 async def list_all_symbols(kind: str, session_id: str) -> str:
     """List all indexed symbols in the repository, optionally filtered by kind.
 
@@ -244,6 +260,7 @@ async def list_all_symbols(kind: str, session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("find_callers")
 async def find_callers_tool(function_name: str, session_id: str) -> str:
     """Find all places in the codebase that call a given function.
 
@@ -275,6 +292,7 @@ async def find_callers_tool(function_name: str, session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("read_code")
 async def read_code(
     file_path: str, start_line: int, end_line: int, session_id: str
 ) -> str:
@@ -309,6 +327,7 @@ async def read_code(
 
 
 @mcp.tool()
+@track_tool("get_imports")
 async def get_imports(file_path: str, session_id: str) -> str:
     """List all imports recorded for a file in the index.
 
@@ -337,6 +356,7 @@ async def get_imports(file_path: str, session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("get_session_status")
 async def get_session_status(session_id: str) -> str:
     """Check if a session exists and is ready for questions.
 
@@ -357,6 +377,7 @@ async def get_session_status(session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("generate_architecture")
 async def generate_architecture_diagram(session_id: str) -> str:
     """Generate a Mermaid.js class diagram of the repository architecture.
 
@@ -382,6 +403,7 @@ async def generate_architecture_diagram(session_id: str) -> str:
 
 
 @mcp.tool()
+@track_tool("semantic_search")
 async def semantic_search_tool(query: str, session_id: str) -> str:
     """Search for concepts using pgvector cosine similarity.
 

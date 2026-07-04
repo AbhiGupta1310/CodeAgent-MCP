@@ -15,8 +15,14 @@ import os
 import re
 from pathlib import Path
 
+import time
 from code_server.db import get_pool
 from code_server.indexer import SKIP_DIRS
+from code_server.telemetry import (
+    trace_span_async,
+    record_search_similarity,
+    record_db_operation,
+)
 
 # ---------------------------------------------------------------------------
 # 1.  find_function — symbol search
@@ -320,73 +326,81 @@ async def generate_architecture(session_id: str) -> str:
 
 async def semantic_search(query: str, session_id: str) -> list[dict]:
     """Search for concepts using pgvector cosine similarity."""
-    hf_token = os.environ.get("HF_TOKEN")
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    query_vector = None
+    async with trace_span_async("mcp.semantic_search", {"query": query}):
+        hf_token = os.environ.get("HF_TOKEN")
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        query_vector = None
 
-    if hf_token:
-        try:
-            import httpx
+        if hf_token:
+            try:
+                import httpx
 
-            headers = {"Authorization": f"Bearer {hf_token}"}
-            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
-            payload = {"inputs": [query], "options": {"wait_for_model": True}}
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                embs = resp.json()
-                query_vector = embs[0]
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("HF API query embedding failed: %s", exc)
+                headers = {"Authorization": f"Bearer {hf_token}"}
+                url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
+                payload = {"inputs": [query], "options": {"wait_for_model": True}}
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(url, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    embs = resp.json()
+                    query_vector = embs[0]
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("HF API query embedding failed: %s", exc)
 
-    elif api_key:
-        try:
-            import httpx
+        elif api_key:
+            try:
+                import httpx
 
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": "openai/text-embedding-3-small",
-                "input": [query],
-                "dimensions": 384,
-            }
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/embeddings",
-                    headers=headers,
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                query_vector = data["data"][0]["embedding"]
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("OpenRouter API query embedding failed: %s", exc)
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": "openai/text-embedding-3-small",
+                    "input": [query],
+                    "dimensions": 384,
+                }
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/embeddings",
+                        headers=headers,
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    query_vector = data["data"][0]["embedding"]
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("OpenRouter API query embedding failed: %s", exc)
 
-    if query_vector is None:
-        from code_server.indexer import get_embedding_model
+        if query_vector is None:
+            from code_server.indexer import get_embedding_model
 
-        model = get_embedding_model()
-        embeddings_gen = await asyncio.to_thread(model.embed, [query])
-        embeddings = await asyncio.to_thread(list, embeddings_gen)
-        query_vector = embeddings[0].tolist()
+            model = get_embedding_model()
+            embeddings_gen = await asyncio.to_thread(model.embed, [query])
+            embeddings = await asyncio.to_thread(list, embeddings_gen)
+            query_vector = embeddings[0].tolist()
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT name, kind, file_path, start_line, end_line, docstring,
-                   1 - (embedding <=> $2::vector) AS similarity
-            FROM   symbols
-            WHERE  session_id = $1 AND embedding IS NOT NULL
-            ORDER  BY embedding <=> $2::vector
-            LIMIT  10
-            """,
-            session_id,
-            str(query_vector),
-        )
-    return [dict(row) for row in rows]
+        start_db = time.perf_counter()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT name, kind, file_path, start_line, end_line, docstring,
+                       1 - (embedding <=> $2::vector) AS similarity
+                FROM   symbols
+                WHERE  session_id = $1 AND embedding IS NOT NULL
+                ORDER  BY embedding <=> $2::vector
+                LIMIT  10
+                """,
+                session_id,
+                str(query_vector),
+            )
+        duration_db = time.perf_counter() - start_db
+        record_db_operation("semantic_search_vector_query", duration_db)
+
+        results = [dict(row) for row in rows]
+        scores = [float(r["similarity"]) for r in results if r.get("similarity") is not None]
+        record_search_similarity(scores)
+        return results
 

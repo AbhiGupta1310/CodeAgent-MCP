@@ -21,10 +21,17 @@ from typing import Optional
 import tree_sitter_python as tspython
 import tree_sitter_javascript as tsjavascript
 import tree_sitter_typescript as tstypescript
+import time
 from tree_sitter import Language, Node, Parser
 from fastembed import TextEmbedding
 
 from code_server.db import get_pool
+from code_server.telemetry import (
+    trace_span_async,
+    record_ast_metrics,
+    record_embedding_metrics,
+    record_db_operation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,100 +135,106 @@ async def generate_embeddings_batch(symbols: list[dict]) -> None:
     if not symbols:
         return
 
-    texts = [
-        f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
-        for s in symbols
-    ]
-
-    hf_token = os.environ.get("HF_TOKEN", "").strip()
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-
-    # Tier 1: Hugging Face Inference API
-    if hf_token:
+    start_time = time.perf_counter()
+    async with trace_span_async("mcp.embeddings.generate_batch", {"symbols_count": len(symbols)}):
         try:
-            import httpx
+            texts = [
+                f"{s['kind']} {s['name']} " + (s['docstring'] if s['docstring'] else "")
+                for s in symbols
+            ]
 
-            logger.info(
-                "Generating embeddings via Hugging Face API (%d symbols, 0%% CPU, 0 MB RAM) ...",
-                len(symbols),
-            )
-            headers = {"Authorization": f"Bearer {hf_token}"}
-            url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
+            hf_token = os.environ.get("HF_TOKEN", "").strip()
+            openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-            batch_size = 32
-            all_embeddings: list[list[float]] = []
+            # Tier 1: Hugging Face Inference API
+            if hf_token:
+                try:
+                    import httpx
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                for i in range(0, len(texts), batch_size):
-                    chunk_texts = texts[i : i + batch_size]
-                    payload = {
-                        "inputs": chunk_texts,
-                        "options": {"wait_for_model": True},
-                    }
-                    resp = await client.post(url, headers=headers, json=payload)
-                    resp.raise_for_status()
-                    chunk_embs = resp.json()
-                    all_embeddings.extend(chunk_embs)
-
-            for s, emb in zip(symbols, all_embeddings):
-                s["embedding"] = str(emb)
-            return
-        except Exception as exc:
-            logger.warning(
-                "Hugging Face API request failed, trying OpenRouter fallback: %s", exc
-            )
-
-    # Tier 2: OpenRouter API
-    if openrouter_key:
-        try:
-            import httpx
-
-            logger.info(
-                "Generating embeddings via OpenRouter API (%d symbols, 0%% CPU, 0 MB RAM) ...",
-                len(symbols),
-            )
-            headers = {
-                "Authorization": f"Bearer {openrouter_key}",
-                "Content-Type": "application/json",
-            }
-            batch_size = 64
-            all_embeddings = []
-
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                for i in range(0, len(texts), batch_size):
-                    chunk_texts = texts[i : i + batch_size]
-                    payload = {
-                        "model": "openai/text-embedding-3-small",
-                        "input": chunk_texts,
-                        "dimensions": 384,
-                    }
-                    resp = await client.post(
-                        "https://openrouter.ai/api/v1/embeddings",
-                        headers=headers,
-                        json=payload,
+                    logger.info(
+                        "Generating embeddings via Hugging Face API (%d symbols, 0%% CPU, 0 MB RAM) ...",
+                        len(symbols),
                     )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    chunk_embs = [item["embedding"] for item in data["data"]]
-                    all_embeddings.extend(chunk_embs)
+                    headers = {"Authorization": f"Bearer {hf_token}"}
+                    url = "https://router.huggingface.co/hf-inference/models/BAAI/bge-small-en-v1.5"
 
-            for s, emb in zip(symbols, all_embeddings):
-                s["embedding"] = str(emb)
-            return
-        except Exception as exc:
-            logger.warning(
-                "OpenRouter API request failed, falling back to local FastEmbed: %s", exc
+                    batch_size = 32
+                    all_embeddings: list[list[float]] = []
+
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        for i in range(0, len(texts), batch_size):
+                            chunk_texts = texts[i : i + batch_size]
+                            payload = {
+                                "inputs": chunk_texts,
+                                "options": {"wait_for_model": True},
+                            }
+                            resp = await client.post(url, headers=headers, json=payload)
+                            resp.raise_for_status()
+                            chunk_embs = resp.json()
+                            all_embeddings.extend(chunk_embs)
+
+                    for s, emb in zip(symbols, all_embeddings):
+                        s["embedding"] = str(emb)
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "Hugging Face API request failed, trying OpenRouter fallback: %s", exc
+                    )
+
+            # Tier 2: OpenRouter API
+            if openrouter_key:
+                try:
+                    import httpx
+
+                    logger.info(
+                        "Generating embeddings via OpenRouter API (%d symbols, 0%% CPU, 0 MB RAM) ...",
+                        len(symbols),
+                    )
+                    headers = {
+                        "Authorization": f"Bearer {openrouter_key}",
+                        "Content-Type": "application/json",
+                    }
+                    batch_size = 64
+                    all_embeddings = []
+
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        for i in range(0, len(texts), batch_size):
+                            chunk_texts = texts[i : i + batch_size]
+                            payload = {
+                                "model": "openai/text-embedding-3-small",
+                                "input": chunk_texts,
+                                "dimensions": 384,
+                            }
+                            resp = await client.post(
+                                "https://openrouter.ai/api/v1/embeddings",
+                                headers=headers,
+                                json=payload,
+                            )
+                            resp.raise_for_status()
+                            data = resp.json()
+                            chunk_embs = [item["embedding"] for item in data["data"]]
+                            all_embeddings.extend(chunk_embs)
+
+                    for s, emb in zip(symbols, all_embeddings):
+                        s["embedding"] = str(emb)
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "OpenRouter API request failed, falling back to local FastEmbed: %s", exc
+                    )
+
+            # Tier 3: Local FastEmbed fallback
+            logger.info(
+                "No HF_TOKEN or OPENROUTER_API_KEY set. Generating embeddings locally via FastEmbed (batch_size=16) ..."
             )
-
-    # Tier 3: Local FastEmbed fallback
-    logger.info(
-        "No HF_TOKEN or OPENROUTER_API_KEY set. Generating embeddings locally via FastEmbed (batch_size=16) ..."
-    )
-    model = get_embedding_model()
-    embeddings_gen = await asyncio.to_thread(model.embed, texts, batch_size=16)
-    embeddings = await asyncio.to_thread(list, embeddings_gen)
-    for s, emb in zip(symbols, embeddings):
-        s["embedding"] = str(emb.tolist())
+            model = get_embedding_model()
+            embeddings_gen = await asyncio.to_thread(model.embed, texts, batch_size=16)
+            embeddings = await asyncio.to_thread(list, embeddings_gen)
+            for s, emb in zip(symbols, embeddings):
+                s["embedding"] = str(emb.tolist())
+        finally:
+            duration = time.perf_counter() - start_time
+            record_embedding_metrics(len(symbols), duration)
 
 
 async def index_file(file_path: str, session_id: str) -> None:
@@ -333,7 +346,15 @@ async def index_repo(repo_path: str, session_id: str) -> None:
             imps.extend(i_list)
         return syms, imps
 
-    all_symbols, all_imports = await asyncio.to_thread(_parse_all)
+    start_ast = time.perf_counter()
+    async with trace_span_async("mcp.treesitter.parse_repo", {"file_count": len(files_to_index)}):
+        all_symbols, all_imports = await asyncio.to_thread(_parse_all)
+        duration_ast = time.perf_counter() - start_ast
+        symbol_counts: dict[str, int] = {}
+        for s in all_symbols:
+            k = s.get("kind", "unknown")
+            symbol_counts[k] = symbol_counts.get(k, 0) + 1
+        record_ast_metrics(symbol_counts, duration_ast)
 
     logger.info(
         "Extracted %d symbols and %d imports across %d files.",
@@ -349,51 +370,55 @@ async def index_repo(repo_path: str, session_id: str) -> None:
 
     # 3. Single Bulk Database Transaction over 1 Connection
     logger.info("Writing symbols and imports to database in a single transaction...")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("DELETE FROM symbols WHERE session_id = $1", session_id)
-            await conn.execute("DELETE FROM imports WHERE session_id = $1", session_id)
+    start_db = time.perf_counter()
+    async with trace_span_async("mcp.db.bulk_insert_session", {"symbols_count": len(all_symbols), "imports_count": len(all_imports)}):
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM symbols WHERE session_id = $1", session_id)
+                await conn.execute("DELETE FROM imports WHERE session_id = $1", session_id)
 
-            if all_symbols:
-                await conn.executemany(
-                    """
-                    INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    """,
-                    [
-                        (
-                            session_id,
-                            s["name"],
-                            s["kind"],
-                            s["file_path"],
-                            s["start_line"],
-                            s["end_line"],
-                            s["parent"],
-                            s["docstring"],
-                            s.get("embedding"),
-                        )
-                        for s in all_symbols
-                    ],
-                )
+                if all_symbols:
+                    await conn.executemany(
+                        """
+                        INSERT INTO symbols (session_id, name, kind, file_path, start_line, end_line, parent, docstring, embedding)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        """,
+                        [
+                            (
+                                session_id,
+                                s["name"],
+                                s["kind"],
+                                s["file_path"],
+                                s["start_line"],
+                                s["end_line"],
+                                s["parent"],
+                                s["docstring"],
+                                s.get("embedding"),
+                            )
+                            for s in all_symbols
+                        ],
+                    )
 
-            if all_imports:
-                await conn.executemany(
-                    """
-                    INSERT INTO imports (session_id, file_path, module, alias, symbol)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    [
-                        (
-                            session_id,
-                            imp["file_path"],
-                            imp["module"],
-                            imp["alias"],
-                            imp["symbol"],
-                        )
-                        for imp in all_imports
-                    ],
-                )
+                if all_imports:
+                    await conn.executemany(
+                        """
+                        INSERT INTO imports (session_id, file_path, module, alias, symbol)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        [
+                            (
+                                session_id,
+                                imp["file_path"],
+                                imp["module"],
+                                imp["alias"],
+                                imp["symbol"],
+                            )
+                            for imp in all_imports
+                        ],
+                    )
+        duration_db = time.perf_counter() - start_db
+        record_db_operation("bulk_insert_session", duration_db)
 
     logger.info("Done indexing %s in single bulk pass.", root)
 
