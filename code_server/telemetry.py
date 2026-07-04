@@ -69,6 +69,9 @@ _db_query_duration_histogram = None
 _similarity_score_histogram = None
 
 
+import urllib.parse
+
+
 def setup_telemetry() -> None:
     """Initialize OpenTelemetry tracer and meter providers if OTLP credentials are configured."""
     global _tracer, _meter, _request_counter, _request_duration_histogram, _tool_counter, _tool_duration_histogram
@@ -79,7 +82,19 @@ def setup_telemetry() -> None:
         logger.info("OpenTelemetry packages not fully installed. Running with local metrics fallback.")
         return
 
-    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    headers_raw = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "").strip()
+
+    # Clean up URL percent encoding (%20 -> space) if present in headers
+    if "%20" in headers_raw:
+        headers_raw = urllib.parse.unquote(headers_raw)
+
+    headers_dict: Dict[str, str] = {}
+    if headers_raw:
+        for item in headers_raw.split(","):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                headers_dict[k.strip()] = v.strip()
 
     resource = Resource.create({"service.name": "codeagent-code-server"})
 
@@ -87,22 +102,35 @@ def setup_telemetry() -> None:
     tracer_provider = TracerProvider(resource=resource)
     if otlp_endpoint:
         try:
-            span_exporter = OTLPSpanExporter()
+            traces_url = otlp_endpoint.rstrip("/")
+            if not traces_url.endswith("/v1/traces"):
+                traces_url = f"{traces_url}/v1/traces"
+
+            span_exporter = OTLPSpanExporter(endpoint=traces_url, headers=headers_dict) if headers_dict else OTLPSpanExporter(endpoint=traces_url)
             tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
-            logger.info("OTLP Trace Exporter initialized (target: %s)", otlp_endpoint)
+            logger.info("OTLP Trace Exporter initialized (target: %s)", traces_url)
         except Exception as e:
             logger.warning("Failed to initialize OTLPSpanExporter: %s", e)
 
     trace.set_tracer_provider(tracer_provider)
     _tracer = trace.get_tracer("codeagent-code-server")
 
+    # Send an initial trace span on startup to instantly verify connection in Grafana
+    if otlp_endpoint:
+        with _tracer.start_as_current_span("mcp.server.startup") as span:
+            span.set_attribute("service.status", "initialized")
+
     # Setup Metrics
     readers = []
     if otlp_endpoint:
         try:
-            metric_exporter = OTLPMetricExporter()
+            metrics_url = otlp_endpoint.rstrip("/")
+            if not metrics_url.endswith("/v1/metrics"):
+                metrics_url = f"{metrics_url}/v1/metrics"
+
+            metric_exporter = OTLPMetricExporter(endpoint=metrics_url, headers=headers_dict) if headers_dict else OTLPMetricExporter(endpoint=metrics_url)
             readers.append(PeriodicExportingMetricReader(metric_exporter, export_interval_millis=15000))
-            logger.info("OTLP Metric Exporter initialized")
+            logger.info("OTLP Metric Exporter initialized (target: %s)", metrics_url)
         except Exception as e:
             logger.warning("Failed to initialize OTLPMetricExporter: %s", e)
 
