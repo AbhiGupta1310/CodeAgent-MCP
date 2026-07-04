@@ -53,6 +53,8 @@ _local_stats: Dict[str, Any] = {
 }
 
 # OpenTelemetry meters & instruments
+_tracer_provider = None
+_meter_provider = None
 _tracer = None
 _meter = None
 _request_counter = None
@@ -74,7 +76,7 @@ import urllib.parse
 
 def setup_telemetry() -> None:
     """Initialize OpenTelemetry tracer and meter providers if OTLP credentials are configured."""
-    global _tracer, _meter, _request_counter, _request_duration_histogram, _tool_counter, _tool_duration_histogram
+    global _tracer_provider, _meter_provider, _tracer, _meter, _request_counter, _request_duration_histogram, _tool_counter, _tool_duration_histogram
     global _indexed_symbols_counter, _indexed_chunks_counter, _treesitter_duration_histogram
     global _embedding_duration_histogram, _db_query_duration_histogram, _similarity_score_histogram
 
@@ -98,8 +100,8 @@ def setup_telemetry() -> None:
 
     resource = Resource.create({"service.name": "codeagent-code-server"})
 
-    # Setup Tracing
-    tracer_provider = TracerProvider(resource=resource)
+    # Setup Tracing with fast 2-second batch export
+    _tracer_provider = TracerProvider(resource=resource)
     if otlp_endpoint:
         try:
             traces_url = otlp_endpoint.rstrip("/")
@@ -107,18 +109,23 @@ def setup_telemetry() -> None:
                 traces_url = f"{traces_url}/v1/traces"
 
             span_exporter = OTLPSpanExporter(endpoint=traces_url, headers=headers_dict) if headers_dict else OTLPSpanExporter(endpoint=traces_url)
-            tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
+            _tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter, scheduled_delay_millis=2000))
             logger.info("OTLP Trace Exporter initialized (target: %s)", traces_url)
         except Exception as e:
             logger.warning("Failed to initialize OTLPSpanExporter: %s", e)
 
-    trace.set_tracer_provider(tracer_provider)
+    trace.set_tracer_provider(_tracer_provider)
     _tracer = trace.get_tracer("codeagent-code-server")
 
-    # Send an initial trace span on startup to instantly verify connection in Grafana
+    # Send an initial trace span on startup and flush immediately to verify connection in Grafana
     if otlp_endpoint:
         with _tracer.start_as_current_span("mcp.server.startup") as span:
             span.set_attribute("service.status", "initialized")
+            span.set_attribute("runtime.env", "render")
+        try:
+            _tracer_provider.force_flush()
+        except Exception:
+            pass
 
     # Setup Metrics
     readers = []
@@ -129,13 +136,13 @@ def setup_telemetry() -> None:
                 metrics_url = f"{metrics_url}/v1/metrics"
 
             metric_exporter = OTLPMetricExporter(endpoint=metrics_url, headers=headers_dict) if headers_dict else OTLPMetricExporter(endpoint=metrics_url)
-            readers.append(PeriodicExportingMetricReader(metric_exporter, export_interval_millis=15000))
+            readers.append(PeriodicExportingMetricReader(metric_exporter, export_interval_millis=5000))
             logger.info("OTLP Metric Exporter initialized (target: %s)", metrics_url)
         except Exception as e:
             logger.warning("Failed to initialize OTLPMetricExporter: %s", e)
 
-    meter_provider = MeterProvider(resource=resource, metric_readers=readers)
-    metrics.set_meter_provider(meter_provider)
+    _meter_provider = MeterProvider(resource=resource, metric_readers=readers)
+    metrics.set_meter_provider(_meter_provider)
     _meter = metrics.get_meter("codeagent-code-server")
 
     # Standard HTTP & Tool Instruments
@@ -151,6 +158,18 @@ def setup_telemetry() -> None:
     _embedding_duration_histogram = _meter.create_histogram("mcp_embedding_duration_seconds", description="Vector embedding generation latency", unit="s")
     _db_query_duration_histogram = _meter.create_histogram("mcp_db_query_duration_seconds", description="Database query duration in seconds", unit="s")
     _similarity_score_histogram = _meter.create_histogram("mcp_semantic_search_similarity_score", description="Similarity scores for pgvector queries", unit="1")
+
+
+def shutdown_telemetry() -> None:
+    """Flush all remaining traces and metrics and shutdown OTel providers cleanly."""
+    global _tracer_provider, _meter_provider
+    if _tracer_provider:
+        try:
+            _tracer_provider.force_flush()
+            _tracer_provider.shutdown()
+            logger.info("OpenTelemetry tracer provider flushed and shut down cleanly.")
+        except Exception as e:
+            logger.warning("Error shutting down tracer provider: %s", e)
 
 
 @contextlib.asynccontextmanager

@@ -52,6 +52,7 @@ from code_server.tools import (
 )
 from code_server.telemetry import (
     setup_telemetry,
+    shutdown_telemetry,
     track_tool,
     get_local_stats,
     StatsMiddleware,
@@ -82,8 +83,11 @@ async def app_lifespan(server: FastMCP):
                 logger.warning("Session cleanup failed: %s", exc)
 
     cleanup_task = asyncio.create_task(_cleanup_loop())
-    yield
-    cleanup_task.cancel()
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        shutdown_telemetry()
 
 mcp = FastMCP("codeagent-code-server", host="0.0.0.0", port=8000, lifespan=app_lifespan)
 
